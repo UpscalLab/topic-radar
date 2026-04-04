@@ -280,10 +280,136 @@ Limite à 5-8 topics et 0-3 alertes. Ne retourne que du JSON valide."""
         return {"summary": "Erreur d'analyse", "topics": [], "alerts": []}
  
  
+# ── Google Trends ──────────────────────────────────────────────
+ 
+ 
+def fetch_google_trends(topics: list[dict]) -> dict:
+    """Récupère les données Google Trends pour les topics identifiés."""
+    try:
+        from pytrends.request import TrendReq
+ 
+        pytrends = TrendReq(hl="fr-FR", tz=60)
+        trends_data = {}
+ 
+        # Extraire les mots-clés des topics (max 5 par requête Google Trends)
+        keywords = [t.get("name", "")[:50] for t in topics[:8] if t.get("name")]
+ 
+        # Traite par lots de 5 (limite Google Trends)
+        for i in range(0, len(keywords), 5):
+            batch = keywords[i:i + 5]
+            try:
+                pytrends.build_payload(batch, timeframe="now 7-d", geo="")
+                interest = pytrends.interest_over_time()
+ 
+                if not interest.empty:
+                    for kw in batch:
+                        if kw in interest.columns:
+                            values = interest[kw].tolist()
+                            trends_data[kw] = {
+                                "current": values[-1] if values else 0,
+                                "average": sum(values) // len(values) if values else 0,
+                                "peak": max(values) if values else 0,
+                                "trend": "rising" if len(values) >= 2 and values[-1] > values[-2] else "stable",
+                                "growth": round(((values[-1] - values[0]) / max(values[0], 1)) * 100) if len(values) >= 2 else 0,
+                            }
+ 
+                time.sleep(2)  # Respecte le rate limit Google
+ 
+            except Exception as e:
+                log.warning(f"Erreur Google Trends batch {batch}: {e}")
+                continue
+ 
+        log.info(f"Google Trends: {len(trends_data)} keywords analysés")
+        return trends_data
+ 
+    except ImportError:
+        log.warning("pytrends non installé, Google Trends désactivé")
+        return {}
+    except Exception as e:
+        log.error(f"Erreur Google Trends: {e}")
+        return {}
+ 
+ 
+def predict_viral(analysis: dict, trends_data: dict) -> list[dict]:
+    """Utilise Claude pour croiser Reddit + Google Trends et prédire la viralité."""
+    if not ANTHROPIC_API_KEY or not trends_data:
+        return []
+ 
+    # Prépare le contexte
+    topics_text = ""
+    for t in analysis.get("topics", []):
+        name = t.get("name", "")
+        gt = trends_data.get(name, {})
+        topics_text += f"- {name} (relevance Reddit: {t.get('relevance', 0)}/10, catégorie: {t.get('category', '')})\n"
+        if gt:
+            topics_text += f"  Google Trends: intérêt actuel={gt['current']}/100, pic={gt['peak']}/100, tendance={gt['trend']}, croissance={gt['growth']}%\n"
+        else:
+            topics_text += f"  Google Trends: pas de données\n"
+ 
+    prompt = f"""Tu es un analyste de tendances. Croise les données Reddit et Google Trends pour prédire quels sujets vont devenir viraux dans les prochaines 48h.
+ 
+Données:
+{topics_text}
+ 
+Règles de scoring:
+- Un sujet trending sur Reddit ET en hausse sur Google Trends = forte probabilité virale
+- Un sujet trending sur Reddit MAIS stable/bas sur Google Trends = buzz limité à Reddit
+- Un sujet en forte hausse sur Google Trends = opportunité de contenu à saisir vite
+ 
+Réponds en JSON strict (pas de markdown):
+{{
+  "predictions": [
+    {{
+      "topic": "Nom du sujet",
+      "viral_score": 1-10,
+      "confidence": "haute|moyenne|faible",
+      "window": "Fenêtre d'opportunité (ex: 24h, 48h, 1 semaine)",
+      "recommendation": "Action recommandée pour un créateur YouTube gaming/tech"
+    }}
+  ]
+}}
+ 
+Classe par viral_score décroissant. Max 5 prédictions. JSON valide uniquement."""
+ 
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        content = resp.json()["content"][0]["text"]
+ 
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+        if content.endswith("```"):
+            content = content.rsplit("```", 1)[0]
+        content = content.strip()
+ 
+        result = json.loads(content)
+        predictions = result.get("predictions", [])
+        log.info(f"Prédictions: {len(predictions)} sujets scorés")
+        return predictions
+ 
+    except Exception as e:
+        log.error(f"Erreur prédiction virale: {e}")
+        return []
+ 
+ 
 # ── Discord ────────────────────────────────────────────────────
  
  
-def send_discord(analysis: dict, post_count: int):
+def send_discord(analysis: dict, post_count: int, predictions: list[dict] = None):
     """Envoie le rapport de tendances sur Discord."""
     if not DISCORD_WEBHOOK_URL:
         log.warning("Pas de webhook Discord configuré")
@@ -316,6 +442,22 @@ def send_discord(analysis: dict, post_count: int):
         ],
         "footer": {"text": f"Scan: {now} • {post_count} posts analysés"},
     }
+ 
+    # Prédictions virales (Google Trends + IA)
+    if predictions:
+        pred_text = ""
+        for p in predictions[:5]:
+            score = p.get("viral_score", 0)
+            conf = {"haute": "🟢", "moyenne": "🟡", "faible": "🔴"}.get(p.get("confidence", ""), "⚪")
+            bar = "█" * score + "░" * (10 - score)
+            pred_text += f"{conf} **{p['topic']}** [{bar}] {score}/10\n"
+            pred_text += f"  └ {p.get('recommendation', '')}\n"
+            pred_text += f"  ⏱ Fenêtre: {p.get('window', 'N/A')}\n\n"
+        embed["fields"].append({
+            "name": "🔮 Prédictions virales (Reddit + Google Trends)",
+            "value": pred_text[:1024],
+            "inline": False,
+        })
  
     # Alertes
     alerts = analysis.get("alerts", [])
@@ -423,16 +565,26 @@ def run_scan():
     # 4. Analyser avec Claude
     analysis = analyze_trends(new_posts if new_posts else all_posts)
  
-    # 5. Envoyer sur Discord
-    send_discord(analysis, len(all_posts))
+    # 5. Google Trends + Prédiction virale
+    predictions = []
+    topics = analysis.get("topics", [])
+    if topics:
+        log.info("Récupération Google Trends...")
+        trends_data = fetch_google_trends(topics)
+        if trends_data:
+            log.info("Analyse prédictive Reddit + Google Trends...")
+            predictions = predict_viral(analysis, trends_data)
  
-    # 6. Envoyer les alertes Ntfy
+    # 6. Envoyer sur Discord
+    send_discord(analysis, len(all_posts), predictions)
+ 
+    # 7. Envoyer les alertes Ntfy
     send_ntfy(analysis)
  
-    # 7. Sauvegarder le rapport
+    # 8. Sauvegarder le rapport
     save_report(analysis, new_posts[:20])
  
-    # 8. Mettre à jour l'état
+    # 9. Mettre à jour l'état
     state["last_scan"] = datetime.now(timezone.utc).isoformat()
     state["scan_count"] = state.get("scan_count", 0) + 1
     save_state(state)
