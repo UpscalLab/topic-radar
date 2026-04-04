@@ -41,13 +41,13 @@ REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
 # Subreddits à surveiller
 SUBREDDITS = [
     # Gaming
-    "gaming", "pcgaming", "Games", "indiegaming", "gamedev",
-    # Tech & IA
-    "technology", "artificial", "MachineLearning", "ChatGPT",
-    # Contenu / YouTube
-    "youtube", "Twitch",
-    # Tendances
-    "Futurology",
+    "gaming", "pcgaming", "Games", "PS5", "XboxSeriesX",
+    "NintendoSwitch", "Steam", "gamedev", "IndieGaming",
+    # Tech
+    "technology", "gadgets", "hardware", "buildapc", "selfhosted",
+    # IA
+    "artificial", "MachineLearning", "ChatGPT", "ClaudeAI",
+    "StableDiffusion", "LocalLLaMA", "singularity",
 ]
  
 # ── Logging ────────────────────────────────────────────────────
@@ -473,4 +473,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
